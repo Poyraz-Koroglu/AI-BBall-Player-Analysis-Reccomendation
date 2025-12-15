@@ -1,82 +1,151 @@
 import torch
 from torch.utils.data import Dataset
+
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from typing import Optional, Dict, Tuple, List
+# preprocess.py
+
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from typing import Optional, Dict, Tuple
+import os
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+# Update this path to your file
+file_path = r"C:\Users\spoyr\OneDrive\Masaüstü\Clean Data (1).xlsx"
+output_filename = "final_training_data.csv"
+
+# ==========================================
+# 2. LOAD DATA (CORRECTED)
+# ==========================================
+print(f"Reading Excel file from: {file_path}...")
+
+try:
+    all_sheets = pd.read_excel(file_path, sheet_name=None)
+except FileNotFoundError:
+    print("❌ Error: File not found. Please check the 'file_path'.")
+    exit()
+
+df_list = []
+for sheet_name, sheet_df in all_sheets.items():
+    # Clean whitespace from column names
+    sheet_df.columns = sheet_df.columns.str.strip()
+
+    # CHECK: Only add 'League' if it's missing.
+    # Since you confirmed it exists, we just use the data as-is.
+    if 'League' not in sheet_df.columns:
+        sheet_df['League'] = sheet_name
+
+    df_list.append(sheet_df)
+    print(f"   -> Loaded sheet: {sheet_name} ({len(sheet_df)} rows)")
+
+full_df = pd.concat(df_list, ignore_index=True)
+
+# ==========================================
+# 3. PREPROCESSING & CLUSTERING
+# ==========================================
+print("Running Clustering...")
+
+# Filter for clustering (ignore players with < 50 mins)
+clustering_df = full_df[full_df['MIN'] > 50].copy()
+
+# Create per-minute stats
+stat_cols = ['FGA', '3PA', 'FTA', 'ORB', 'DRB', 'AST', 'STL', 'BLK', 'TOV', 'PTS']
+features_for_clustering = []
+
+for col in stat_cols:
+    new_col = f'{col}_per_min'
+    # safe division
+    clustering_df[new_col] = clustering_df[col] / (clustering_df['MIN'] + 1e-6)
+    features_for_clustering.append(new_col)
+
+# Scale
+scaler = StandardScaler()
+X = scaler.fit_transform(clustering_df[features_for_clustering].fillna(0))
+
+# K-Means
+kmeans = KMeans(n_clusters=5, random_state=42)
+clustering_df['Archetype'] = kmeans.fit_predict(X)
+
+# Merge back: We prefer to keep all rows, even if they weren't clustered (assign -1 or similar if needed)
+# For simplicity in ML, we usually just keep the clustered ones or infer the rest.
+# Let's keep only valid players for the training set.
+full_df = clustering_df.copy()
+
+# ==========================================
+# 4. CREATE TARGET (Improved?)
+# ==========================================
+print("Calculating improvement targets...")
+
+
+def get_start_year(s):
+    try:
+        return int(str(s).split(' - ')[0])
+    except:
+        return 0
+
+
+full_df['Year'] = full_df['Season'].apply(get_start_year)
+
+# Calculate EFF
+full_df['EFF'] = (
+        full_df['PTS'] + full_df['REB'] + full_df['AST'] + full_df['STL'] + full_df['BLK']
+        - (full_df['FGA'] - full_df['FGM'])
+        - (full_df['FTA'] - full_df['FTM'])
+        - full_df['TOV']
+)
+full_df['EFF_per_min'] = full_df['EFF'] / (full_df['MIN'] + 1e-6)
+
+# Sort and Shift
+full_df = full_df.sort_values(['Player', 'Year'])
+full_df['Next_Season_EFF'] = full_df.groupby('Player')['EFF_per_min'].shift(-1)
+full_df['Improved'] = (full_df['Next_Season_EFF'] > full_df['EFF_per_min']).astype(int)
+
+# Drop rows without a next season
+final_data = full_df.dropna(subset=['Next_Season_EFF'])
+
+# ==========================================
+# 5. SAVE
+# ==========================================
+final_path = os.path.join(os.getcwd(), output_filename)
+final_data.to_csv(final_path, index=False)
+
+print(f"\n✅ SUCCESS! Saved to: {final_path}")
+print(f"Rows: {len(final_data)}")
 
 class BasketballPlayerDataset(Dataset):
-    """
-    PyTorch Dataset for basketball player statistics and improvement prediction.
-
-    Args:
-        df: DataFrame containing player statistics
-        target_col: Name of the target column (improvement label)
-        scale_features: Whether to standardize numerical features
-        categorical_cols: List of categorical columns to encode
-        feature_cols: List of feature columns to use (if None, uses all stat columns)
-    """
-
     def __init__(
             self,
             df: pd.DataFrame,
             target_col: Optional[str] = None,
-            scale_features: bool = True,
-            categorical_cols: Optional[list] = None,
-            feature_cols: Optional[list] = None
+            numerical_cols: Optional[List[str]] = None,
+            categorical_cols: Optional[List[str]] = None,
+            # Pass existing scalers/encoders for Test sets
+            scaler: Optional[StandardScaler] = None,
+            label_encoders: Optional[Dict[str, LabelEncoder]] = None
     ):
         self.df = df.copy()
         self.target_col = target_col
-        self.scale_features = scale_features
 
-        # Default categorical columns
-        if categorical_cols is None:
-            categorical_cols = ['League', 'Stage', 'Team']
-        self.categorical_cols = categorical_cols
+        # 1. Setup Column Definitions
+        self.categorical_cols = categorical_cols if categorical_cols else ['League', 'Stage', 'Team']
+        self.numerical_cols = numerical_cols if numerical_cols else [
+            'GP', 'MIN', 'FGM', 'FGA', '3PM', '3PA',
+            'FTM', 'FTA', 'TOV', 'PF', 'DRB', 'ORB',
+            'REB', 'AST', 'STL', 'BLK', 'PTS'
+        ]
 
-        # Default feature columns (all numeric stats)
-        if feature_cols is None:
-            feature_cols = [
-                'GP', 'MIN', 'FGM', 'FGA', '3PM', '3PA',
-                'FTM', 'FTA', 'TOV', 'PF', 'DRB', 'ORB',
-                'REB', 'AST', 'STL', 'BLK', 'PTS'
-            ]
-        self.feature_cols = feature_cols
+        # 2. Handle Scalers & Encoders (Avoid Data Leakage)
+        self.scaler = scaler
+        self.label_encoders = label_encoders if label_encoders else {}
 
-        # Initialize encoders and scalers
-        self.label_encoders: Dict[str, LabelEncoder] = {}
-        self.scaler: Optional[StandardScaler] = None
+        # 3. Process Data
+        self._process_features()
 
-        # Process the data
-        self._process_data()
-
-    def _process_data(self):
-        """Process and encode categorical variables, scale features."""
-
-        # Encode categorical columns
-        for col in self.categorical_cols:
-            if col in self.df.columns:
-                le = LabelEncoder()
-                self.df[f'{col}_encoded'] = le.fit_transform(self.df[col].astype(str))
-                self.label_encoders[col] = le
-
-        # Create list of encoded categorical columns
-        self.encoded_cat_cols = [f'{col}_encoded' for col in self.categorical_cols
-                                 if col in self.df.columns]
-
-        # Combine feature columns with encoded categoricals
-        self.all_feature_cols = self.feature_cols + self.encoded_cat_cols
-
-        # Extract features
-        self.features = self.df[self.all_feature_cols].values.astype(np.float32)
-
-        # Scale features if requested
-        if self.scale_features:
-            self.scaler = StandardScaler()
-            self.features = self.scaler.fit_transform(self.features)
-
-        # Extract targets if provided
+        # 4. Process Target
         if self.target_col and self.target_col in self.df.columns:
             self.targets = self.df[self.target_col].values
             self.has_targets = True
@@ -84,90 +153,55 @@ class BasketballPlayerDataset(Dataset):
             self.targets = None
             self.has_targets = False
 
-        # Store metadata (player names, season, etc.)
-        self.metadata = self.df[['Player', 'Season']].copy() if 'Player' in self.df.columns else None
+    def _process_features(self):
+        # --- A. Categorical Encoding ---
+        # We keep these as Integers (Long) for Embeddings
+        self.cat_features = []
+        for col in self.categorical_cols:
+            # Handle unknown categories safely by converting to string
+            self.df[col] = self.df[col].astype(str)
 
-    def __len__(self) -> int:
-        """Return the number of samples in the dataset."""
-        return len(self.features)
+            if col not in self.label_encoders:
+                # Fit new encoder (Training mode)
+                le = LabelEncoder()
+                le.fit(self.df[col])
+                self.label_encoders[col] = le
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
-        """
-        Get a single sample from the dataset.
+            # Transform (handle unseen labels in test by mapping to a default if needed,
+            # here we blindly transform for simplicity but real ML needs 'unknown' handling)
+            # A simple trick: use .map and fillna for unknown classes
+            le = self.label_encoders[col]
 
-        Returns:
-            If targets exist: (features, target)
-            If no targets: (features,)
-        """
-        features = torch.tensor(self.features[idx], dtype=torch.float32)
+            # Safe transform: unknown classes get set to 0
+            known_classes = set(le.classes_)
+            self.df[col] = self.df[col].apply(lambda x: x if x in known_classes else le.classes_[0])
+
+            encoded_col = le.transform(self.df[col])
+            self.cat_features.append(encoded_col)
+
+        # Stack categorical features: Shape (N, num_cat_features)
+        self.cat_features = np.stack(self.cat_features, axis=1).astype(np.int64)
+
+        # --- B. Numerical Scaling ---
+        # We keep these as Floats for the Network
+        num_data = self.df[self.numerical_cols].values.astype(np.float32)
+
+        if self.scaler is None:
+            self.scaler = StandardScaler()
+            self.num_features = self.scaler.fit_transform(num_data)
+        else:
+            self.num_features = self.scaler.transform(num_data)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        # Return Numeric and Categorical separately
+        x_num = torch.tensor(self.num_features[idx], dtype=torch.float32)
+        x_cat = torch.tensor(self.cat_features[idx], dtype=torch.long)
 
         if self.has_targets:
-            target = torch.tensor(self.targets[idx], dtype=torch.long)
-            return features, target
+            y = torch.tensor(self.targets[idx], dtype=torch.float32)  # float for BCELoss, long for CrossEntropy
+            return x_num, x_cat, y
         else:
-            return (features,)
-
-    def get_feature_names(self) -> list:
-        """Return list of feature names in order."""
-        return self.all_feature_cols
-
-    def get_metadata(self, idx: int) -> Dict:
-        """Get metadata for a specific sample."""
-        if self.metadata is not None:
-            return self.metadata.iloc[idx].to_dict()
-        return {}
-
-    def inverse_transform_features(self, scaled_features: np.ndarray) -> np.ndarray:
-        """Inverse transform scaled features back to original scale."""
-        if self.scaler is not None:
-            return self.scaler.inverse_transform(scaled_features)
-        return scaled_features
-
-    def get_categorical_mapping(self, col: str) -> Dict:
-        """Get the mapping for a categorical column."""
-        if col in self.label_encoders:
-            le = self.label_encoders[col]
-            return dict(zip(le.classes_, le.transform(le.classes_)))
-        return {}
-
-
-if __name__ == "__main__":
-    # Create sample data
-    sample_data = {
-        'League': ['NBA', 'NBA', 'EuroLeague'],
-        'Season': ['2023-24', '2023-24', '2023-24'],
-        'Stage': ['Regular', 'Regular', 'Regular'],
-        'Player': ['Player A', 'Player B', 'Player C'],
-        'Team': ['Team1', 'Team2', 'Team3'],
-        'GP': [72, 65, 58],
-        'MIN': [32.5, 28.3, 25.1],
-        'FGM': [8, 7, 6],
-        'FGA': [16, 14, 13],
-        '3PM': [2, 3, 2],
-        '3PA': [6, 7, 5],
-        'FTM': [4, 3, 2],
-        'FTA': [5, 4, 3],
-        'TOV': [2, 3, 2],
-        'PF': [2, 3, 2],
-        'DRB': [4, 3, 3],
-        'ORB': [1, 1, 1],
-        'REB': [5, 4, 4],
-        'AST': [6, 4, 3],
-        'STL': [1, 1, 1],
-        'BLK': [0, 1, 1],
-        'PTS': [22, 20, 16],
-        'improved': [1, 0, 1]  # Target variable
-    }
-
-    df = pd.DataFrame(sample_data)
-
-    # Create dataset
-    dataset = BasketballPlayerDataset(
-        df=df,
-        target_col='improved',
-        scale_features=True
-    )
-
-    print(f"Dataset size: {len(dataset)}")
-    print(f"Feature names: {dataset.get_feature_names()}")
-    print(f"Sample: {dataset[0]}")
+            return x_num, x_cat
