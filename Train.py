@@ -143,5 +143,5 @@ def train_model(self,
            print(f"🛑 Early stopping triggered after {epoch + 1} epochs")
            break
 
-       self.load_state_dict(best_model_wts)
-       return history
+   self.load_state_dict(best_model_wts)
+   return history
