@@ -143,7 +143,8 @@ class BasketballPlayerDataset(Dataset):
             numerical_cols: Optional[List[str]] = None,
             categorical_cols: Optional[List[str]] = None,
             scaler: Optional[StandardScaler] = None,
-            label_encoders: Optional[Dict[str, LabelEncoder]] = None
+            label_encoders: Optional[Dict[str, LabelEncoder]] = None,
+            scale_features: bool = True,
     ):
         self.df = df.copy()
         self.target_col = target_col
