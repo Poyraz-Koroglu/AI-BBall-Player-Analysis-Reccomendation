@@ -1,7 +1,7 @@
 import copy
 
 import torch
-from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 from torch import nn
 from torch import optim
@@ -9,6 +9,7 @@ from torch.optim import AdamW, Adam
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
+
 
 def train_model(self,
                 train_loader: DataLoader,
@@ -22,15 +23,15 @@ def train_model(self,
                 weight_decay: float = 1e-5,
                 patience: int = 5,
                 label_smoothing: float = 0.1,
+                min_delta: float = 0.001,
+                scheduler=None
                 ):
 
 
 
    self.to(device)
 
-   for param_group in optimizer.param_groups:
-       param_group['lr'] = learning_rate
-       param_group['weight_decay'] = weight_decay
+
 
    best_val_loss = float('inf')
    best_model_wts = copy.deepcopy(self.state_dict())
@@ -118,6 +119,8 @@ def train_model(self,
                val_labels.extend(y.cpu().numpy().flatten())
 
        epoch_val_loss = val_loss / len(val_loader)
+       if scheduler is not None:
+        scheduler.step(epoch_val_loss)
        epoch_val_acc = 100 * np.mean(np.array(val_predictions) == np.array(val_labels))
 
        # Record history
@@ -130,7 +133,7 @@ def train_model(self,
              f"Val Loss {epoch_val_loss:.4f} ({epoch_val_acc:.1f}%)")
 
 
-       if epoch_val_loss < best_val_loss:
+       if epoch_val_loss + min_delta < best_val_loss:
            best_val_loss = epoch_val_loss
            best_model_wts = copy.deepcopy(self.state_dict())
            patience_counter = 0
@@ -145,3 +148,73 @@ def train_model(self,
 
    self.load_state_dict(best_model_wts)
    return history
+
+
+def evaluate(
+        self,
+        dataloader: DataLoader,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+):
+    """
+    Evaluate the basketball stats model on a dataset
+
+    Args:
+        dataloader: DataLoader for evaluation data
+        device: Device to evaluate on
+
+    Returns:
+        Dictionary containing evaluation metrics
+    """
+    self.eval()
+    self.to(device)
+
+    all_predictions = []
+    all_labels = []
+    total_loss = 0.0
+
+    # Matches your training criterion
+    criterion = nn.BCEWithLogitsLoss()
+
+    with torch.no_grad():
+        pbar = tqdm(dataloader, desc="Evaluating Stats Model")
+
+        for x_num, x_cat, y in pbar:
+            # Moving data to device and matching training dimensions
+            x_num = x_num.to(device)
+            x_cat = x_cat.to(device)
+            y = y.to(device).unsqueeze(1)
+
+            # Forward pass
+            logits = self(x_num, x_cat)
+            loss = criterion(logits, y)
+
+            total_loss += loss.item()
+
+            # Binary classification logic (matches your train code)
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
+
+            all_predictions.extend(preds.cpu().numpy().flatten())
+            all_labels.extend(y.cpu().numpy().flatten())
+
+    # Calculate metrics
+    avg_loss = total_loss / len(dataloader)
+
+    # Convert to numpy arrays for calculation
+    all_labels_np = np.array(all_labels)
+    all_preds_np = np.array(all_predictions)
+
+    accuracy = 100 * np.mean(all_preds_np == all_labels_np)
+
+    # Using sklearn for detailed stats as in your previous project
+    results = {
+        'loss': avg_loss,
+        'accuracy': accuracy,
+        'classification_report': classification_report(all_labels_np, all_preds_np),
+        'confusion_matrix': confusion_matrix(all_labels_np, all_preds_np)
+    }
+
+    logging.info(f"Evaluation - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
+
+    return results
+
