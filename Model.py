@@ -9,7 +9,8 @@ class ImprovementPredictor(nn.Module):
             num_numerical_features,
             categorical_cardinalities,
             embedding_dims=None,
-            hidden_units=[64, 32]
+            hidden_units=[256, 128, 64],
+            dropout=0.4
     ):
         """
         Args:
@@ -43,8 +44,9 @@ class ImprovementPredictor(nn.Module):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.BatchNorm1d(hidden_dim))  # Batch Norm helps convergence
             layers.append(nn.ReLU())
-            layers.append(nn.Dropout(0.3))  # Dropout prevents overfitting
+            layers.append(nn.Dropout(dropout))  # Dropout prevents overfitting
             in_dim = hidden_dim
+
 
         self.feature_extractor = nn.Sequential(*layers)
 

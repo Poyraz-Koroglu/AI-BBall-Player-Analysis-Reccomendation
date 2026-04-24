@@ -11,10 +11,10 @@ from Train import *
 # Ensure Dataset.py and model.py are in the same directory
 from Dataset import BasketballPlayerDataset
 from Model import ImprovementPredictor
-'''
-print(torch.cuda.is_available())
+
+#print(torch.cuda.is_available())
 #print(torch.cuda.get_device_name(0))
-'''
+
 
 # ==========================================
 # 1. CONFIGURATION
@@ -73,11 +73,21 @@ for col in dataset.categorical_cols:
 model = ImprovementPredictor(
     num_numerical_features=len(dataset.numerical_cols),
     categorical_cardinalities=cat_cardinalities,
-    hidden_units=[128, 64] # Architecture: Input -> 128 -> 64 -> Output
+    hidden_units=[256, 128, 64],# Architecture: Input -> 128 -> 64 -> Output
+    dropout=0.4
 )
 
 # Setup Optimizer (Learning Rate will be set in train_model call)
-optimizer = torch.optim.Adam(model.parameters())
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode='min',
+    factor=0.5,
+    patience=3,
+    verbose=True
+)
+
 criterion = nn.BCEWithLogitsLoss()
 
 # ==========================================
@@ -93,10 +103,12 @@ history = train_model(
     criterion=criterion,
     epochs=30,             # Maximum epochs
     learning_rate=0.001,   # Initial learning rate
-    patience=5,            # Early stopping patience
+    patience=10,            # Early stopping patience
     label_smoothing=0.1,   # 0.1 means we are 90% confident (good for sports noise)
     device=DEVICE,
-    save_path="basketball_model_best.pth"
+    save_path="basketball_model_best.pth",
+    scheduler=scheduler,
+    min_delta=0.001
     )
 
 # ==========================================

@@ -6,135 +6,150 @@ from torch.utils.data import Dataset
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from typing import Optional, Dict, Tuple, List
-
+'''
 # ==========================================
 # PART 1: PREPROCESSING SCRIPT
 # (Run this once to generate the CSV, then comment it out)
 # ==========================================
 
-if __name__ == "__main__":
-    # 1. CONFIGURATION
-    # ==========================================
-    # Your specific path
-    file_path = r"C:\Users\spoyr\OneDrive\Masaüstü\Clean Data (1).xlsx"
-    output_filename = "final_training_data_cumulative.csv"
+# 1. CONFIGURATION
+file_path = r"D:\PycharmProjects\final_training_data_cumulative.csv"
+output_filename = "final_training_data_cumulative.csv"
 
-    # 2. LOAD DATA
-    # ==========================================
-    print(f"Reading Excel file from: {file_path}...")
+# 2. LOAD DATA
+print(f"Reading Excel file...")
+try:
+    all_sheets = pd.read_excel(file_path, sheet_name=None)
+except FileNotFoundError:
+    print("❌ Error: File not found.")
+    exit()
 
+df_list = []
+for sheet_name, sheet_df in all_sheets.items():
+    sheet_df.columns = sheet_df.columns.str.strip()
+    if 'League' not in sheet_df.columns:
+        sheet_df['League'] = sheet_name
+    df_list.append(sheet_df)
+
+full_df = pd.concat(df_list, ignore_index=True)
+
+# --- ADD THIS FIX ---
+# Rename the columns so they match what your formulas and PyTorch model expect
+global_column_mapping = {
+    'FG': 'FGM',
+    '3P': '3PM',
+    'FT': 'FTM',
+    'TRB': 'REB',
+    'G': 'GP',
+    'MP': 'MIN'
+}
+# Only rename columns that actually exist to prevent errors
+full_df.rename(columns={k: v for k, v in global_column_mapping.items() if k in full_df.columns}, inplace=True)
+# --------------------
+
+# 3. ADVANCED FEATURE ENGINEERING
+# ==========================================
+print("Generating Advanced Basketball Stats...")
+eps = 1e-6
+
+# A. Efficiency Metrics
+# True Shooting % (Adjusts for the value of FT and 3PT)
+full_df['TS_pct'] = full_df['PTS'] / (2 * (full_df['FGA'] + 0.44 * full_df['FTA']) + eps)
+# Effective FG %
+full_df['eFG_pct'] = (full_df['FGM'] + 0.5 * full_df['3PM']) / (full_df['FGA'] + eps)
+# Free Throw Rate
+full_df['FT_Rate'] = full_df['FTA'] / (full_df['FGA'] + eps)
+
+# B. Playmaking & Workload
+full_df['AST_TOV_ratio'] = full_df['AST'] / (full_df['TOV'] + eps)
+full_df['Usage_Proxy'] = (full_df['FGA'] + 0.44 * full_df['FTA'] + full_df['TOV'])
+
+
+# C. Biological Context (Age) --- [FIXED SECTION] ---
+def get_start_year(s):
     try:
-        all_sheets = pd.read_excel(file_path, sheet_name=None)
-    except FileNotFoundError:
-        print("❌ Error: File not found. Please check the 'file_path'.")
-        exit()
+        # .strip() and splitting by '-' handles both '2021-22' and '2021 - 22' safely
+        return int(str(s).split('-')[0].strip())
+    except:
+        return 0
 
-    df_list = []
-    for sheet_name, sheet_df in all_sheets.items():
-        sheet_df.columns = sheet_df.columns.str.strip()
+full_df['Year'] = full_df['Season'].apply(get_start_year)
 
-        # Add League if missing
-        if 'League' not in sheet_df.columns:
-            sheet_df['League'] = sheet_name
+# 1. Standardize 'Age' if it came from the new CSV/Excel
+if 'Age' in full_df.columns:
+    full_df.rename(columns={'Age': 'age'}, inplace=True)
 
-        df_list.append(sheet_df)
-        print(f"   -> Loaded sheet: {sheet_name} ({len(sheet_df)} rows)")
+# 2. Find and standardize the birth year column (e.g., 'birth year', 'Birth_Year')
+for col in full_df.columns:
+    if col.lower().replace(' ', '_') == 'birth_year':
+        full_df.rename(columns={col: 'birth_year'}, inplace=True)
+        break
 
-    full_df = pd.concat(df_list, ignore_index=True)
+# 3. Calculate Age Safely
+if 'age' not in full_df.columns:
+    full_df['age'] = pd.NA
+
+if 'birth_year' in full_df.columns:
+    full_df['birth_year'] = pd.to_numeric(full_df['birth_year'], errors='coerce')
+    # Fill missing ages using the math. Leaves existing ages alone!
+    full_df['age'] = full_df['age'].fillna(full_df['Year'] - full_df['birth_year'])
+
+# 4. Safety net: Default missing ages to 25 to prevent model crashes
+full_df['age'] = full_df['age'].fillna(25)
+# ---------------------------------------------------
 
 
-    # 3. CLEANING & FORMATTING
-    # ==========================================
-    def get_start_year(s):
-        try:
-            return int(str(s).split(' - ')[0])
-        except:
-            return 0
+# D. Per Minute Normalization
+#  identify players improving in quality even if minutes stay the same
+full_df['PTS_per_min'] = full_df['PTS'] / (full_df['MIN'] + eps)
+full_df['AST_per_min'] = full_df['AST'] / (full_df['MIN'] + eps)
+full_df['REB_per_min'] = (full_df['ORB'] + full_df['DRB']) / (full_df['MIN'] + eps)
 
+full_df['FGA_per_min'] = full_df['FGA'] / (full_df['MIN'] + eps)
+full_df['3PA_per_min'] = full_df['3PA'] / (full_df['MIN'] + eps)
+# 4. CLEANING & CUMULATIVE FEATURES
+# ==========================================
+full_df['EFF'] = (full_df['PTS'] + full_df['REB'] + full_df['AST'] + full_df['STL'] + full_df['BLK']
+                  - (full_df['FGA'] - full_df['FGM']) - (full_df['FTA'] - full_df['FTM']) - full_df['TOV'])
+full_df['EFF_per_min'] = full_df['EFF'] / (full_df['MIN'] + eps)
 
-    full_df['Year'] = full_df['Season'].apply(get_start_year)
+full_df = full_df.sort_values(['Player', 'Year'])
+grouped = full_df.groupby('Player')
 
-    # Calculate Efficiency (EFF) per Minute
-    full_df['EFF'] = (
-            full_df['PTS'] + full_df['REB'] + full_df['AST'] + full_df['STL'] + full_df['BLK']
-            - (full_df['FGA'] - full_df['FGM'])
-            - (full_df['FTA'] - full_df['FTM'])
-            - full_df['TOV']
-    )
-    full_df['EFF_per_min'] = full_df['EFF'] / (full_df['MIN'] + 1e-6)
+full_df['Career_GP'] = grouped['GP'].cumsum()
+full_df['Career_MIN'] = grouped['MIN'].cumsum()
+full_df['Career_EFF_Avg'] = grouped['EFF_per_min'].expanding().mean().reset_index(0, drop=True)
+full_df['Prev_Season_EFF'] = grouped['EFF_per_min'].shift(1)
+full_df['Trend_EFF'] = (full_df['EFF_per_min'] - full_df['Prev_Season_EFF']).fillna(0)
 
-    # Sort by Player and Year for history calculations
-    full_df = full_df.sort_values(['Player', 'Year'])
+# 5. CLUSTERING & TARGET CREATION
+# ==========================================
+print("Finalizing Clustering and Targets...")
+clustering_df = full_df[full_df['MIN'] > 50].copy()
+# Use your original stat_cols but add our new normalized ones
+stat_cols = ['FGA_per_min', '3PA_per_min', 'AST_per_min', 'REB_per_min', 'TS_pct', 'age']
 
-    # 4. ADD CUMULATIVE / HISTORY FEATURES (NEW!)
-    # ==========================================
-    print("Generating Cumulative Career Stats...")
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(clustering_df[stat_cols].fillna(0))
+kmeans = KMeans(n_clusters=5, random_state=42, n_init=10)
+clustering_df['Archetype'] = kmeans.fit_predict(X_scaled)
 
-    grouped = full_df.groupby('Player')
+full_df = clustering_df.copy()
+full_df['Next_Season_EFF'] = full_df.groupby('Player')['EFF_per_min'].shift(-1)
+full_df['Improved'] = (full_df['Next_Season_EFF'] > full_df['EFF_per_min']).astype(int)
 
-    # A. Experience
-    full_df['Career_GP'] = grouped['GP'].cumsum()
-    full_df['Career_MIN'] = grouped['MIN'].cumsum()
+final_data = full_df.dropna(subset=['Next_Season_EFF'])
 
-    # B. Career Averages (Expanding Mean)
-    full_df['Career_EFF_Avg'] = grouped['EFF_per_min'].expanding().mean().reset_index(0, drop=True)
-
-    # C. Trend (vs Previous Season)
-    full_df['Prev_Season_EFF'] = grouped['EFF_per_min'].shift(1)
-    full_df['Trend_EFF'] = (full_df['EFF_per_min'] - full_df['Prev_Season_EFF']).fillna(0)
-
-    # 5. CLUSTERING (ARCHETYPES)
-    # ==========================================
-    print("Running Clustering...")
-
-    # Filter for clustering (valid minutes only)
-    clustering_df = full_df[full_df['MIN'] > 50].copy()
-
-    stat_cols = ['FGA', '3PA', 'FTA', 'ORB', 'DRB', 'AST', 'STL', 'BLK', 'TOV', 'PTS']
-    features_for_clustering = []
-
-    for col in stat_cols:
-        new_col = f'{col}_per_min'
-        clustering_df[new_col] = clustering_df[col] / (clustering_df['MIN'] + 1e-6)
-        features_for_clustering.append(new_col)
-
-    scaler = StandardScaler()
-    X = scaler.fit_transform(clustering_df[features_for_clustering].fillna(0))
-
-    kmeans = KMeans(n_clusters=5, random_state=42)
-    clustering_df['Archetype'] = kmeans.fit_predict(X)
-
-    # Merge Archetypes back
-    full_df = clustering_df.copy()
-
-    # 6. CREATE TARGET (Improved?)
-    # ==========================================
-    print("Calculating improvement targets...")
-
-    # Re-sort to be safe
-    full_df = full_df.sort_values(['Player', 'Year'])
-
-    full_df['Next_Season_EFF'] = full_df.groupby('Player')['EFF_per_min'].shift(-1)
-    full_df['Improved'] = (full_df['Next_Season_EFF'] > full_df['EFF_per_min']).astype(int)
-
-    # Drop rows without a next season (Training Data)
-    final_data = full_df.dropna(subset=['Next_Season_EFF'])
-
-    # 7. SAVE
-    # ==========================================
-    final_path = os.path.join(os.getcwd(), output_filename)
-    final_data.to_csv(final_path, index=False)
-
-    print(f"\n✅ SUCCESS! Saved to: {final_path}")
-    print(f"Rows: {len(final_data)}")
-    print("New columns added: 'Career_GP', 'Career_MIN', 'Career_EFF_Avg', 'Trend_EFF'")
-
+# 6. SAVE
+final_path = os.path.join(os.getcwd(), output_filename)
+final_data.to_csv(final_path, index=False)
+print(f"\n✅ SUCCESS! Data ready for GPU training with advanced features.")
+'''
 
 # ==========================================
 # PART 2: DATASET CLASS
 # (This is what you import in your training script)
 # ==========================================
-
 class BasketballPlayerDataset(Dataset):
     def __init__(
             self,
