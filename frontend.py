@@ -16,7 +16,7 @@ st.set_page_config(page_title="AI Basketball Scout", layout="wide", initial_side
 def load_ai_engine():
     # 1. Load original training data to reconstruct the exact model shape and scalers
     # This ensures team IDs and stat scaling match the training environment
-    df_train = pd.read_csv("final_training_data_cumulative.csv")
+    df_train = pd.read_csv("Data/final_training_data_cumulative.csv")
 
     # Initialize the dataset once to harvest its scaler and label encoders
     master_ds = BasketballPlayerDataset(df=df_train, target_col='Improved')
@@ -41,7 +41,7 @@ def load_ai_engine():
 try:
     ai_model, master_ds = load_ai_engine()
     # Load your actual test dataset for the player list
-    full_test_df = pd.read_csv("NBA-Test-Result.csv")
+    full_test_df = pd.read_csv("Data/NBA-Test-Result.csv")
 except Exception as e:
     st.error(f"Error loading model or data: {e}")
     st.stop()
