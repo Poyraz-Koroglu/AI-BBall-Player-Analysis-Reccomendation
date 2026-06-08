@@ -2,10 +2,12 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import torch
+import torch.nn as nn
 import os
+
 # Import your actual logic from the repo
-from Dataset import BasketballPlayerDataset
-from Model import ImprovementPredictor
+from Train import BasketballImprovementModel
+from GameLogsDataset import BasketballPlayerDataset
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="AI Basketball Scout", layout="wide", initial_sidebar_state="collapsed")
@@ -14,48 +16,57 @@ st.set_page_config(page_title="AI Basketball Scout", layout="wide", initial_side
 # --- LOAD MODEL & DATASET UTILS ---
 @st.cache_resource
 def load_ai_engine():
-    # 1. Load original training data to reconstruct the exact model shape and scalers
-    # This ensures team IDs and stat scaling match the training environment
-    df_train = pd.read_csv("Data/final_training_data_cumulative.csv")
+    # 1. Load the master tensor data to initialize scalers and shapes
+    df_train = pd.read_csv("Data/ml_ready_data.csv")
+    master_ds = BasketballPlayerDataset(df=df_train)
 
-    # Initialize the dataset once to harvest its scaler and label encoders
-    master_ds = BasketballPlayerDataset(df=df_train, target_col='Improved')
+    n_leagues = len(master_ds.label_encoders['competition'].classes_)
+    n_archetypes = len(master_ds.label_encoders['archetype_cluster'].classes_)
 
-    # 2. Rebuild the Model Architecture
-    cat_cardinalities = [len(master_ds.label_encoders[col].classes_) + 1 for col in master_ds.categorical_cols]
-    model = ImprovementPredictor(
-        num_numerical_features=len(master_ds.numerical_cols),
-        categorical_cardinalities=cat_cardinalities,
-        hidden_units=[256, 128, 64]
-    )
+    model = BasketballImprovementModel(cat_dims=[n_leagues, n_archetypes]).to("cpu")
 
-    # 3. Load the saved weights
-    if os.path.exists("basketball_model_best.pth"):
-        model.load_state_dict(torch.load("basketball_model_best.pth", map_location="cpu"))
+    # 2. Load weights
+    weights_path = "Data/basketball_model.pth"
+    if os.path.exists(weights_path):
+        model.load_state_dict(torch.load(weights_path, map_location="cpu"))
     model.eval()
 
     return model, master_ds
 
 
-# --- INITIALIZE ENGINE ---
+# --- INITIALIZE ENGINE & DATASETS ---
 try:
     ai_model, master_ds = load_ai_engine()
-    # Load your actual test dataset for the player list
+
+    # Human-readable list for UI mapping
     full_test_df = pd.read_csv("Data/NBA-Test-Result.csv")
+
+    # Unified ML features dataset matching the exact shape of your tensor train pipeline
+    ml_features_df = pd.read_csv("Data/ml_ready_data.csv")
+
+    # ==========================================
+    # RETIREMENT FILTER: ISOLATE 2024-2025 ACTIVE ROSTER
+    # ==========================================
+    active_24_25_players = full_test_df[full_test_df['Season'] == '2024-2025']['Player'].unique()
+    full_test_df = full_test_df[full_test_df['Player'].isin(active_24_25_players)]
+
 except Exception as e:
     st.error(f"Error loading model or data: {e}")
     st.stop()
 
 # --- INITIALIZE STATE ---
-if 'selected_player' not in st.session_state:
-    st.session_state.selected_player = full_test_df['Player'].iloc[0]
+# FIXED: Default initialized to the first available index matching our active roster pool
+if 'selected_index' not in st.session_state:
+    st.session_state.selected_index = int(full_test_df.index[0]) if not full_test_df.empty else 0
 
 # --- UI LOGIC ---
 st.title("🏀 AI-Powered Basketball Scout")
 search_query = st.text_input("Search players in the test set...", placeholder="e.g., LeBron James")
 
-# 1. FIX: Sort by Year (newest first) and drop duplicates so each player only gets ONE card
+# Sort and drop duplicates on the human data while retaining index references
 display_df = full_test_df.copy()
+display_df['original_idx'] = display_df.index  # Lock the alignment pointer
+
 if 'Year' in display_df.columns:
     display_df = display_df.sort_values('Year', ascending=False)
 display_df = display_df.drop_duplicates(subset=['Player'], keep='first')
@@ -64,15 +75,15 @@ display_df = display_df.drop_duplicates(subset=['Player'], keep='first')
 if search_query:
     display_df = display_df[display_df['Player'].str.contains(search_query, case=False, na=False)]
 
-col_filters, col_list, col_details = st.columns([1, 1.2, 2.8], gap="large")
+col_filters, col_list, col_details = st.columns([1.1, 1.2, 2.7], gap="medium")
 
 # ==========================================
-# COLUMN 1: FILTERS (Using Actual Data Columns)
+# COLUMN 1: INTUITIVE SCOUTING FILTERS (PER GAME)
 # ==========================================
 with col_filters:
     st.subheader("Scouting Filters")
 
-    # Safely handle leagues and ages
+    # Demographics & League Choices
     available_leagues = display_df['League'].dropna().unique()
     selected_leagues = st.multiselect("Leagues", available_leagues, default=available_leagues)
 
@@ -80,86 +91,156 @@ with col_filters:
     max_age = int(display_df['age'].max()) if pd.notna(display_df['age'].max()) else 40
     age_range = st.slider("Age", min_age, max_age, (min_age, max_age))
 
+    # Style Profile Dropdown
+    archetype_options = ["All Archetypes"] + list(master_ds.label_encoders['archetype_cluster'].classes_)
+    selected_archetype = st.selectbox("Player Archetype", archetype_options)
+
+    st.markdown("---")
+
+    # FIXED: Sliders changed to traditional, real-world Per-Game targets instead of fractional Per-Min numbers
+    st.markdown("**Minimum Per-Game Targets**")
+    min_pts_pg = st.slider("Points / Game", 0.0, 35.0, 0.0, step=1.0)
+    min_ast_pg = st.slider("Assists / Game", 0.0, 12.0, 0.0, step=0.5)
+    min_reb_pg = st.slider("Rebounds / Game", 0.0, 15.0, 0.0, step=0.5)
+    min_stl_pg = st.slider("Steals / Game", 0.0, 3.0, 0.0, step=0.1)
+    min_blk_pg = st.slider("Blocks / Game", 0.0, 4.0, 0.0, step=0.1)
+
+    # Initial geographical and demographic slice
     filtered_df = display_df[
         (display_df['League'].isin(selected_leagues)) &
         (display_df['age'] >= age_range[0]) & (display_df['age'] <= age_range[1])
         ]
 
+    # Advanced statistical filtering matrix pass
+    # Advanced statistical filtering matrix pass
+    # Advanced statistical filtering matrix pass
+    # Advanced statistical filtering matrix pass
+    valid_indices = []
+    for idx in filtered_df['original_idx']:
+        # Pull the row directly from your human-readable table
+        ui_row = full_test_df.loc[idx]
+
+        # Get total Games Played to calculate traditional averages
+        gp = ui_row.get('GP', 1)
+        if gp <= 0: gp = 1
+
+        # THE CORRECT MATHEMATICAL CONVERSION:
+        # Divide total season statistics by total games played
+        pg_pts = ui_row.get('PTS', 0) / gp
+        pg_ast = ui_row.get('AST', 0) / gp
+        pg_reb = ui_row.get('REB', 0) / gp
+        pg_stl = ui_row.get('STL', 0) / gp
+        pg_blk = ui_row.get('BLK', 0) / gp
+
+        # Verify if the player's true per-game average passes your slider thresholds
+        stat_check = (
+                pg_pts >= min_pts_pg and
+                pg_ast >= min_ast_pg and
+                pg_reb >= min_reb_pg and
+                pg_stl >= min_stl_pg and
+                pg_blk >= min_blk_pg
+        )
+
+        # Verify archetype cluster constraint
+        arch_check = True
+        if selected_archetype != "All Archetypes":
+            # Map column name to 'Archetype' to match the uploaded file
+            arch_check = (ui_row.get('Archetype') == selected_archetype)
+
+        if stat_check and arch_check:
+            valid_indices.append(idx)
+
+    # Filter the display pool down to the true verified indices
+    filtered_df = filtered_df[filtered_df['original_idx'].isin(valid_indices)]
 # ==========================================
-# COLUMN 2: PLAYER LIST
+# BATCH INFERENCE & SYSTEM AUTOMATIC RANKING
 # ==========================================
-with col_list:
-    st.subheader("Results")
-    with st.container(height=700):
-        for _, row in filtered_df.iterrows():
-            with st.container(border=True):
-                c1, c2 = st.columns([3, 1])
-                c1.markdown(f"**{row['Player']}**")
+if not filtered_df.empty:
+    ai_scores = []
+    for _, row in filtered_df.iterrows():
+        idx = int(row['original_idx'])
+        p_ml_row = ml_features_df.loc[[idx]].copy() # FIXED: .loc matching absolute indexing
 
-                # 2. FIX: Safely display age in case of missing data (which breaks buttons)
-                safe_age = int(row['age']) if pd.notna(row['age']) else "N/A"
-                c1.caption(f"{row['Team']} | Age: {safe_age}")
-
-                # 3. FIX: Simplified, unique button key
-                if st.button("Analyze", key=f"btn_{row['Player']}", use_container_width=True):
-                    st.session_state.selected_player = row['Player']
-                    st.rerun()
-
-# ==========================================
-# COLUMN 3: LIVE AI INFERENCE & ANALYTICS
-# ==========================================
-with col_details:
-    # 1. Grab the exact row for the selected player
-    player_row = filtered_df[filtered_df['Player'] == st.session_state.selected_player]
-
-    if not player_row.empty:
-        p_data = player_row.iloc[0]
-
-        # --- AI SCOUT INFERENCE ---
-        # Wrap the single player row in the Dataset class to ensure correct preprocessing
         single_player_ds = BasketballPlayerDataset(
-            df=player_row,
+            df=p_ml_row,
             scaler=master_ds.scaler,
             label_encoders=master_ds.label_encoders
         )
-        x_num, x_cat = single_player_ds[0]
+        x_num, x_cat, _ = single_player_ds[0]
 
-        # Run the neural network
+        with torch.no_grad():
+            logits = ai_model(x_num.unsqueeze(0), x_cat.unsqueeze(0))
+            prob = torch.sigmoid(logits).item()
+        ai_scores.append(prob)
+
+    filtered_df['ai_score'] = ai_scores
+    filtered_df = filtered_df.sort_values(by='ai_score', ascending=False)
+
+# ==========================================
+# COLUMN 2: AUTOMATICALLY RANKED RESULT POOL
+# ==========================================
+with col_list:
+    st.subheader(f"Results ({len(filtered_df)})")
+    with st.container(height=720):
+        if filtered_df.empty:
+            st.info("No prospects match your criteria.")
+        else:
+            for _, row in filtered_df.iterrows():
+                with st.container(border=True):
+                    c1, c2 = st.columns([2.5, 1.5])
+
+                    c1.markdown(f"**{row['Player']}**")
+                    c2.markdown(f"`AI: {row['ai_score'] * 100:.1f}%`")
+
+                    safe_age = int(row['age']) if pd.notna(row['age']) else "N/A"
+                    c1.caption(f"{row['Team']} | Age: {safe_age}")
+
+                    if st.button("Analyze", key=f"btn_{row['original_idx']}", use_container_width=True):
+                        st.session_state.selected_index = int(row['original_idx'])
+                        st.rerun()
+
+# ==========================================
+# COLUMN 3: LIVE ANALYTICS EXPANSION PANEL
+# ==========================================
+with col_details:
+    # FIXED: Query the frozen data matrices using .loc key mappings directly
+    if 'selected_index' in st.session_state and st.session_state.selected_index in ml_features_df.index:
+        p_ui_data = full_test_df.loc[st.session_state.selected_index]
+        p_ml_row = ml_features_df.loc[[st.session_state.selected_index]].copy()
+
+        single_player_ds = BasketballPlayerDataset(
+            df=p_ml_row,
+            scaler=master_ds.scaler,
+            label_encoders=master_ds.label_encoders
+        )
+        x_num, x_cat, _ = single_player_ds[0]
+
         with torch.no_grad():
             logits = ai_model(x_num.unsqueeze(0), x_cat.unsqueeze(0))
             prob = torch.sigmoid(logits).item()
 
-        # --- DYNAMIC AGE-BASED SCOUTING TIERS ---
-        player_age = p_data['age']
+        player_age = p_ui_data['age']
 
-        # 1. The Sure-Fire Improvers (Any age, high confidence)
-        if prob >= 0.55:
-            scout_badge = "✅ PROJECTION: STRONG IMPROVEMENT LIKELY"
+        if prob >= 0.40:
+            scout_badge = "✅ PROJECTION: IMPROVEMENT LIKELY"
             badge_type = "success"
-
-        # 2. The Young Upside Swings (Under 24, 35%-54% confidence)
-        elif prob >= 0.35 and player_age <= 23:
+        elif prob >= 0.28 and player_age <= 23:
             scout_badge = "⚠️ PROJECTION: HIGH-VARIANCE PROSPECT (Upside Swing)"
             badge_type = "warning"
-
-        # 3. The Prime Maintainers (Age 24-28, borderline confidence)
-        elif prob >= 0.40 and 24 <= player_age <= 28:
+        elif prob >= 0.32 and 24 <= player_age <= 28:
             scout_badge = "➡️ PROJECTION: PRIME MAINTENANCE"
             badge_type = "info"
-
-        # 4. The Decliners (Everyone else)
         else:
             scout_badge = "❌ PROJECTION: PLATEAU OR DECLINE"
             badge_type = "error"
 
-        # --- HEADER UI ---
-        st.markdown(f"# {p_data['Player']}")
-        st.caption(f"Season: {p_data['Season']} | Team: {p_data['Team']} | Age: {int(player_age)}")
+        st.markdown(f"# {p_ui_data['Player']}")
+        st.caption(
+            f"Season: {p_ui_data['Season']} | Team: {p_ui_data['Team']} | Age: {int(player_age)} | Archetype: {p_ml_row['archetype_cluster'].values[0]}")
 
         score_col, result_col = st.columns(2)
         score_col.metric("AI Confidence Score", f"{prob * 100:.1f}%")
 
-        # Render the dynamic badge based on the tier
         if badge_type == "success":
             result_col.success(scout_badge)
         elif badge_type == "warning":
@@ -171,46 +252,44 @@ with col_details:
 
         st.divider()
 
-        # --- VISUALIZATIONS & ADVANCED STATS ---
         chart_c1, chart_c2 = st.columns(2)
 
         with chart_c1:
             st.markdown("**Efficiency vs Career Average**")
-            # Using current EFF, historical average, and Trend from your dataset
             metrics = ["Current EFF", "Career Avg", "Trend"]
-            vals = [p_data['EFF_per_min'], p_data['Career_EFF_Avg'], p_data['Trend_EFF']]
+            vals = [
+                p_ml_row.get('cluster_eff').values[0],
+                p_ml_row.get('career_eff').values[0],
+                p_ml_row.get('trend_eff').values[0]
+            ]
 
             fig_bar = go.Figure(go.Bar(x=metrics, y=vals, marker_color='#E97451'))
             fig_bar.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10))
             st.plotly_chart(fig_bar, use_container_width=True)
 
-            # Advanced metrics (Replaced PER with Real AI Inputs)
             st.markdown("**Advanced Metrics**")
             adv_c1, adv_c2, adv_c3 = st.columns(3)
 
-            # Use .get() safely in case any columns are named slightly differently
-            ts_pct = p_data.get('TS_pct', 0)
-            usg_pct = p_data.get('USG_pct', 0)  # Change to a different stat if USG isn't in your CSV
+            ts_pct = p_ml_row.get('ts_pct').values[0]
+            trend_eff = p_ml_row.get('trend_eff').values[0]
 
-            adv_c1.metric("True Shooting", f"{ts_pct * 100:.1f}%")
-            adv_c2.metric("EFF Trend", f"{p_data['Trend_EFF']:.2f}")
+            adv_c1.metric("True Shooting", f"{ts_pct:.1f}%")
+            adv_c2.metric("EFF Trend", f"{trend_eff:.2f}")
 
-            # If you don't have usage, we fall back to something universally useful like minutes
-            if 'USG_pct' in p_data:
-                adv_c3.metric("Usage %", f"{usg_pct * 100:.1f}%")
+            if 'minutes_played' in p_ml_row.columns:
+                adv_c3.metric("Minutes Played", int(p_ml_row.get('minutes_played').values[0]))
             else:
-                adv_c3.metric("Career Mins", int(p_data.get('Career_MIN', 0)))
+                adv_c3.metric("Age Baseline", int(player_age))
 
         with chart_c2:
             st.markdown("**Archetype Radar**")
-            # Categories based on your advanced feature engineering
-            categories = ['PTS/Min', 'AST/Min', 'REB/Min', 'TS%', 'FT Rate']
+            categories = ['PTS/Min', 'AST/Min', 'REB/Min', 'STL/Min', 'BLK/Min']
             stats = [
-                p_data.get('PTS_per_min', 0),
-                p_data.get('AST_per_min', 0),
-                p_data.get('REB_per_min', 0),
-                p_data.get('TS_pct', 0),
-                p_data.get('FT_Rate', 0)
+                p_ml_row.get('points_per_min').values[0],
+                p_ml_row.get('assists_per_min').values[0],
+                p_ml_row.get('tot_reb_per_min').values[0],
+                p_ml_row.get('steals_per_min').values[0],
+                p_ml_row.get('blocks_per_min').values[0]
             ]
 
             fig_radar = go.Figure(go.Scatterpolar(r=stats, theta=categories, fill='toself', line_color='#1f77b4'))
